@@ -11,6 +11,7 @@ from transformers import pipeline
 
 from .config import Config
 from .llm_utils import LLMUtils
+from .cache import get_cache_manager
 
 # 로깅 설정
 logger = logging.getLogger(__name__)
@@ -58,6 +59,7 @@ class SentimentAnalyzer:
             pipeline_kwargs["device"] = device
         if dtype is not None:
             pipeline_kwargs["torch_dtype"] = dtype
+        pipeline_kwargs["batch_size"] = batch_size  # FP16 양자화 및 배치 크기 적용
         
         self.sentiment = pipeline("sentiment-analysis", **pipeline_kwargs)
         
@@ -66,6 +68,9 @@ class SentimentAnalyzer:
         self.llm_utils = llm_utils or LLMUtils()
         self.score_threshold = score_threshold
         self.llm_keywords = llm_keywords or Config.LLM_KEYWORDS
+        
+        # 캐싱 매니저 (Phase 2)
+        self.cache = get_cache_manager()
     
     def analyze(
         self,
@@ -109,8 +114,42 @@ class SentimentAnalyzer:
         for i in range(0, len(review_list), batch_size):
             batch = review_list[i:i + batch_size]
             try:
-                # 배치로 한 번에 처리 (성능 향상)
-                batch_results = self.sentiment(batch)
+                # 캐싱 확인 (Phase 2)
+                cached_results = []
+                uncached_texts = []
+                uncached_indices = []
+                
+                for idx, text in enumerate(batch):
+                    cache_key = f"{text}"
+                    cached = self.cache.get("sentiment", cache_key)
+                    if cached:
+                        cached_results.append((idx, cached))
+                    else:
+                        uncached_texts.append(text)
+                        uncached_indices.append(idx)
+                
+                # 캐시되지 않은 텍스트만 처리
+                if uncached_texts:
+                    # 배치로 한 번에 처리 (성능 향상)
+                    uncached_results = self.sentiment(uncached_texts)
+                    
+                    # 결과 캐싱
+                    for text, result in zip(uncached_texts, uncached_results):
+                        # 캐시 저장 (TTL: 24시간)
+                        self.cache.set("sentiment", text, result, ttl=86400)
+                else:
+                    uncached_results = []
+                
+                # 캐시된 결과와 새 결과 병합
+                batch_results = [None] * len(batch)
+                
+                # 캐시된 결과 삽입
+                for idx, result in cached_results:
+                    batch_results[idx] = result
+                
+                # 새 결과 삽입
+                for uncached_idx, result in zip(uncached_indices, uncached_results):
+                    batch_results[uncached_idx] = result
                 
                 for text, result in zip(batch, batch_results):
                     label = result["label"]

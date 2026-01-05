@@ -4,6 +4,7 @@ LLM 유틸리티 모듈 (Qwen2.5-7B-Instruct 사용)
 
 import json
 import logging
+import os
 import re
 import torch
 from typing import Dict, List, Optional, Any
@@ -11,6 +12,7 @@ from typing import Dict, List, Optional, Any
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import Config
+from .cache import get_cache_manager
 
 logger = logging.getLogger(__name__)
 
@@ -18,13 +20,32 @@ logger = logging.getLogger(__name__)
 class LLMUtils:
     """LLM 관련 유틸리티 클래스 (Qwen 모델 사용)"""
     
-    def __init__(self, model_name: str = Config.LLM_MODEL, device: Optional[str] = None):
+    def __init__(
+        self,
+        model_name: str = Config.LLM_MODEL,
+        device: Optional[str] = None,
+        use_vllm: bool = False,
+        vllm_url: Optional[str] = None,
+    ):
         """
         Args:
             model_name: 사용할 모델명 (기본값: Qwen/Qwen2.5-7B-Instruct)
             device: 사용할 디바이스 (None이면 자동 선택: cuda > mps > cpu)
+            use_vllm: vLLM 사용 여부 (Phase 2)
+            vllm_url: vLLM 서버 URL (기본값: http://localhost:8001)
         """
         self.model_name = model_name
+        self.use_vllm = use_vllm or (os.getenv("VLLM_ENABLED", "false").lower() == "true")
+        self.vllm_url = vllm_url or os.getenv("VLLM_URL", "http://localhost:8001")
+        
+        # vLLM 사용 시 Transformers 모델 로드 생략
+        if self.use_vllm:
+            logger.info(f"vLLM 모드로 초기화 (URL: {self.vllm_url})")
+            self.model = None
+            self.tokenizer = None
+            self.device = None
+            self.batch_size = Config.get_optimal_batch_size("llm")
+            return
         
         # 디바이스 자동 선택
         if device is None:
@@ -72,6 +93,9 @@ class LLMUtils:
         
         self.model.eval()
         logger.info(f"✅ Qwen 모델 로딩 완료: {model_name}")
+        
+        # 캐싱 매니저 (Phase 2)
+        self.cache = get_cache_manager()
     
     def _fix_truncated_json(self, text: str) -> str:
         """
@@ -103,11 +127,43 @@ class LLMUtils:
         
         return text
     
+    def _call_vllm(self, prompt: str, temperature: float = 0.3, max_tokens: int = 150) -> str:
+        """
+        vLLM 서버를 호출하여 응답을 생성합니다. (Phase 2)
+        
+        Args:
+            prompt: 프롬프트 텍스트
+            temperature: 생성 온도
+            max_tokens: 최대 토큰 수
+            
+        Returns:
+            생성된 응답 텍스트
+        """
+        try:
+            import requests
+            
+            response = requests.post(
+                f"{self.vllm_url}/generate",
+                json={
+                    "prompt": prompt,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result.get("text", "").strip()
+        except Exception as e:
+            logger.error(f"vLLM 호출 실패: {str(e)}")
+            raise
+    
     def _generate_response(
         self, 
         messages: List[Dict[str, str]], 
         temperature: float = 0.3,
-        max_new_tokens: int = 50
+        max_new_tokens: int = 50,
+        use_cache: bool = True,
     ) -> str:
         """
         Qwen 모델을 사용하여 응답을 생성합니다.
@@ -116,10 +172,59 @@ class LLMUtils:
             messages: 대화 메시지 리스트 (OpenAI 형식)
             temperature: 생성 온도
             max_new_tokens: 최대 생성 토큰 수 (기본값: 50, 요약/강점 추출 시 더 큰 값 필요)
+            use_cache: 캐싱 사용 여부 (기본값: True)
             
         Returns:
             생성된 응답 텍스트
         """
+        # 캐싱 확인 (Phase 2)
+        if use_cache and self.cache.enabled:
+            cache_key = json.dumps({"messages": messages, "temperature": temperature, "max_tokens": max_new_tokens}, sort_keys=True)
+            cached = self.cache.get("llm", cache_key)
+            if cached:
+                logger.debug("LLM 응답 캐시 히트")
+                return cached
+        
+        # vLLM 사용 시
+        if self.use_vllm:
+            # Qwen chat template 형식으로 변환
+            # 토크나이저가 없을 수 있으므로 간단한 템플릿 변환 사용
+            # 또는 토크나이저만 로드하여 템플릿 적용
+            try:
+                # 토크나이저만 로드하여 템플릿 적용
+                from transformers import AutoTokenizer
+                temp_tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
+                prompt = temp_tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+            except Exception as e:
+                logger.warning(f"템플릿 변환 실패, 간단한 형식 사용: {str(e)}")
+                # 간단한 템플릿 변환
+                prompt_parts = []
+                for msg in messages:
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    if role == "system":
+                        prompt_parts.append(f"System: {content}")
+                    elif role == "user":
+                        prompt_parts.append(f"User: {content}")
+                    elif role == "assistant":
+                        prompt_parts.append(f"Assistant: {content}")
+                
+                prompt = "\n".join(prompt_parts) + "\nAssistant:"
+            
+            response = self._call_vllm(prompt, temperature, max_new_tokens)
+            
+            # 캐시 저장 (TTL: 1시간)
+            if use_cache and self.cache.enabled:
+                cache_key = json.dumps({"messages": messages, "temperature": temperature, "max_tokens": max_new_tokens}, sort_keys=True)
+                self.cache.set("llm", cache_key, response, ttl=3600)
+            
+            return response
+        
+        # 기존 Transformers 방식
         # Qwen chat template 형식으로 변환
         text = self.tokenizer.apply_chat_template(
             messages,
@@ -154,8 +259,14 @@ class LLMUtils:
             output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
         ]
         response = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        response = response.strip()
         
-        return response.strip()
+        # 캐시 저장 (TTL: 1시간)
+        if use_cache and self.cache.enabled:
+            cache_key = json.dumps({"messages": messages, "temperature": temperature, "max_tokens": max_new_tokens}, sort_keys=True)
+            self.cache.set("llm", cache_key, response, ttl=3600)
+        
+        return response
     
     def classify_reviews(
         self,

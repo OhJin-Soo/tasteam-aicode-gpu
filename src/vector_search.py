@@ -12,9 +12,11 @@ from qdrant_client import QdrantClient, models
 from qdrant_client.models import PointStruct
 from sentence_transformers import SentenceTransformer
 import torch
+import numpy as np
 
 from .config import Config
 from .review_utils import extract_image_urls, validate_review_data, validate_restaurant_data
+from .cache import get_cache_manager
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,9 @@ class VectorSearch:
         
         self.client = qdrant_client
         self.collection_name = collection_name
+        
+        # 캐싱 매니저 (Phase 2)
+        self.cache = get_cache_manager()
         
         # 컬렉션이 없으면 생성
         try:
@@ -131,8 +136,46 @@ class VectorSearch:
             batch_metadata = review_metadata[i:i + batch_size]
             
             try:
-                # 배치 인코딩 (한 번에 처리하여 성능 향상)
-                batch_vectors = self.encoder.encode(batch_texts)
+                # 캐싱 확인 (Phase 2)
+                cached_vectors = []
+                uncached_texts = []
+                uncached_indices = []
+                
+                for idx, text in enumerate(batch_texts):
+                    cached = self.cache.get("embedding", text)
+                    if cached:
+                        cached_vectors.append((idx, cached))
+                    else:
+                        uncached_texts.append(text)
+                        uncached_indices.append(idx)
+                
+                # 캐시되지 않은 텍스트만 인코딩
+                batch_vectors = []
+                if uncached_texts:
+                    # 배치 인코딩 (한 번에 처리하여 성능 향상)
+                    uncached_vectors = self.encoder.encode(uncached_texts)
+                    
+                    # 결과 캐싱 (TTL: 24시간)
+                    for text, vector in zip(uncached_texts, uncached_vectors):
+                        self.cache.set("embedding", text, vector.tolist(), ttl=86400)
+                else:
+                    uncached_vectors = []
+                
+                # 캐시된 벡터와 새 벡터 병합
+                merged_vectors = [None] * len(batch_texts)
+                
+                # 캐시된 벡터 삽입
+                for idx, vector_list in cached_vectors:
+                    if isinstance(vector_list, list):
+                        merged_vectors[idx] = np.array(vector_list)
+                    else:
+                        merged_vectors[idx] = vector_list
+                
+                # 새 벡터 삽입
+                for uncached_idx, vector in zip(uncached_indices, uncached_vectors):
+                    merged_vectors[uncached_idx] = vector
+                
+                batch_vectors = merged_vectors
                 
                 for text, vector, metadata in zip(batch_texts, batch_vectors, batch_metadata):
                     try:
@@ -275,7 +318,14 @@ class VectorSearch:
             검색 결과 리스트 (payload와 score 포함)
         """
         try:
-            query_vector = self.encoder.encode(query_text).tolist()
+            # 캐싱 확인 (Phase 2)
+            cached_vector = self.cache.get("embedding", query_text)
+            if cached_vector:
+                query_vector = cached_vector if isinstance(cached_vector, list) else cached_vector.tolist()
+            else:
+                query_vector = self.encoder.encode(query_text).tolist()
+                # 캐시 저장 (TTL: 24시간)
+                self.cache.set("embedding", query_text, query_vector, ttl=86400)
             
             filter_conditions = []
             if restaurant_id:
@@ -382,9 +432,15 @@ class VectorSearch:
             # 2. Point ID 생성 (review_id 기반)
             point_id = self._get_point_id(restaurant_id, review_id)
             
-            # 3. 벡터 인코딩
+            # 3. 벡터 인코딩 (캐싱 확인)
             review_text = review["review"]
-            vector = self.encoder.encode(review_text).tolist()
+            cached_vector = self.cache.get("embedding", review_text)
+            if cached_vector:
+                vector = cached_vector if isinstance(cached_vector, list) else cached_vector.tolist()
+            else:
+                vector = self.encoder.encode(review_text).tolist()
+                # 캐시 저장 (TTL: 24시간)
+                self.cache.set("embedding", review_text, vector, ttl=86400)
             
             # 4. 현재 버전 확인
             current_version = review.get("version", 1)
