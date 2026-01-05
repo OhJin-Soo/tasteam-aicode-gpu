@@ -8,6 +8,9 @@ USE_GPU=true
 GPU_DEVICE=0
 USE_FP16=true
 
+# 모델 다운로드 제어
+PRE_DOWNLOAD_MODELS=true  # 첫 실행 시 true, 이후 false
+
 # 모델 캐시 경로 (RunPod 네트워크 스토리지)
 MODEL_CACHE_PATH=/workspace/models
 HF_HOME=/workspace/models
