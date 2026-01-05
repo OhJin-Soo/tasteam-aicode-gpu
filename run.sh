@@ -6,7 +6,7 @@
 sleep 2
 
 # Run your application
-python /app/main.py
+python /app/app.py
 
 # Wait for background processes
 wait
